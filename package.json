@@ -1,6 +1,6 @@
 {
   "name": "cinemaos-stremio-addon",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "CinemaOS Stremio Addon - Streaming sources from CinemaOS",
   "main": "addon.js",
   "scripts": {

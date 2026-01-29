@@ -4,10 +4,13 @@ const crypto = require("crypto");
 
 const CINEMA_OS_API = "https://cinemaos.tech";
 
+// Cache for ID conversions to avoid repeated API calls
+const idCache = new Map();
+
 // Manifest for the addon
 const manifest = {
     id: "com.cinemaos.stremio",
-    version: "1.0.0",
+    version: "1.1.0",
     name: "CinemaOS",
     description: "Stream movies and TV shows from CinemaOS sources",
     logo: "https://cinemaos.tech/logo.png",
@@ -95,7 +98,6 @@ function cinemaOSDecryptResponse(encrypted, cin, mao, salt) {
     );
 
     // AES-256-GCM decrypt using createDecipheriv
-    // In Node.js, GCM mode is specified in the algorithm string
     const decipher = crypto.createDecipheriv("aes-256-gcm", key, ivBytes);
     decipher.setAuthTag(authTagBytes);
 
@@ -163,6 +165,71 @@ function getQualityFromName(qualityName) {
     if (quality.includes("480") || quality.includes("sd")) return 480;
     if (quality.includes("360")) return 360;
     return 1080;
+}
+
+// Convert IMDB ID to TMDB ID using Cinemeta (Stremio's metadata provider)
+async function imdbToTmdbId(imdbId, type) {
+    // Check cache first
+    const cacheKey = `${imdbId}_${type}`;
+    if (idCache.has(cacheKey)) {
+        console.log(`Using cached TMDB ID for ${imdbId}: ${idCache.get(cacheKey)}`);
+        return idCache.get(cacheKey);
+    }
+
+    try {
+        // Use Cinemeta API (Stremio's official metadata provider)
+        const cinemetaType = type === "movie" ? "movie" : "series";
+        const cinemetaUrl = `https://v3-cinemeta.strem.io/meta/${cinemetaType}/${imdbId}.json`;
+
+        console.log(`Converting IMDB to TMDB: ${cinemetaUrl}`);
+
+        const response = await axios.get(cinemetaUrl, {
+            timeout: 10000,
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+        });
+
+        if (response.data && response.data.meta && response.data.meta.id) {
+            // Cinemeta returns the meta ID which might be tmdb:xxx format
+            const metaId = response.data.meta.id;
+            let tmdbId = null;
+
+            if (metaId.startsWith("tmdb:")) {
+                tmdbId = metaId.replace("tmdb:", "");
+            } else if (response.data.meta.tmdb_id) {
+                tmdbId = response.data.meta.tmdb_id.toString();
+            }
+
+            if (tmdbId) {
+                console.log(`Found TMDB ID ${tmdbId} for IMDB ID ${imdbId}`);
+                idCache.set(cacheKey, tmdbId);
+                return tmdbId;
+            }
+        }
+
+        // Fallback: Try to extract from trailer streams if available
+        if (response.data && response.data.meta && response.data.meta.trailers) {
+            const trailers = response.data.meta.trailers;
+            for (const trailer of trailers) {
+                if (trailer.source && trailer.source.includes("tmdb")) {
+                    const match = trailer.source.match(/tmdb\/(\d+)/);
+                    if (match) {
+                        const tmdbId = match[1];
+                        console.log(`Found TMDB ID ${tmdbId} from trailer for IMDB ID ${imdbId}`);
+                        idCache.set(cacheKey, tmdbId);
+                        return tmdbId;
+                    }
+                }
+            }
+        }
+
+        console.log(`Could not find TMDB ID for IMDB ID ${imdbId}`);
+        return null;
+    } catch (error) {
+        console.error(`Error converting IMDB to TMDB for ${imdbId}:`, error.message);
+        return null;
+    }
 }
 
 // Main function to invoke CinemaOS
@@ -292,6 +359,12 @@ builder.defineStreamHandler(async (args) => {
         const ids = extractIds(id);
         imdbId = ids.imdbId;
         tmdbId = ids.tmdbId;
+
+        // If we have IMDB ID but no TMDB ID, convert it
+        if (imdbId && !tmdbId) {
+            console.log(`Converting IMDB ID ${imdbId} to TMDB ID...`);
+            tmdbId = await imdbToTmdbId(imdbId, "movie");
+        }
     } else if (type === "series") {
         // Series ID format: tt1234567:1:2 (imdb:season:episode) or tmdb:12345:1:2
         const parts = id.split(":");
@@ -299,6 +372,12 @@ builder.defineStreamHandler(async (args) => {
             imdbId = parts[0];
             season = parseInt(parts[1]) || null;
             episode = parseInt(parts[2]) || null;
+
+            // Convert IMDB to TMDB for series
+            if (imdbId) {
+                console.log(`Converting series IMDB ID ${imdbId} to TMDB ID...`);
+                tmdbId = await imdbToTmdbId(imdbId, "series");
+            }
         } else if (parts[0] === "tmdb") {
             tmdbId = parts[1];
             season = parseInt(parts[2]) || null;
@@ -306,15 +385,42 @@ builder.defineStreamHandler(async (args) => {
         }
     }
 
-    if (!imdbId && !tmdbId) {
-        console.log("No valid ID found");
+    if (!tmdbId) {
+        console.log("No valid TMDB ID found - CinemaOS requires TMDB ID to fetch streams");
         return { streams: [] };
     }
 
-    // We need to fetch metadata to get the title and year
-    // For now, we'll try to get streams without title/year as they're optional in the API
-    const streams = await invokeCinemaOS(imdbId, tmdbId, null, season, episode, null);
+    // Fetch metadata to get title and year for better results
+    let title = null;
+    let year = null;
 
+    try {
+        const cinemetaType = type === "movie" ? "movie" : "series";
+        const lookupId = imdbId || `tmdb:${tmdbId}`;
+        const cinemetaUrl = `https://v3-cinemeta.strem.io/meta/${cinemetaType}/${lookupId}.json`;
+
+        console.log(`Fetching metadata from: ${cinemetaUrl}`);
+
+        const metaResponse = await axios.get(cinemetaUrl, {
+            timeout: 10000,
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+        });
+
+        if (metaResponse.data && metaResponse.data.meta) {
+            const meta = metaResponse.data.meta;
+            title = meta.name || meta.title || null;
+            year = meta.year || null;
+            console.log(`Got metadata - Title: ${title}, Year: ${year}`);
+        }
+    } catch (error) {
+        console.log("Could not fetch metadata, proceeding without title/year:", error.message);
+    }
+
+    const streams = await invokeCinemaOS(imdbId, tmdbId, title, season, episode, year);
+
+    console.log(`Returning ${streams.length} streams for ${id}`);
     return { streams };
 });
 
