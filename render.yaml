@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: cinemaos-stremio-addon
+    runtime: docker
+    plan: free
+    branch: main
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 7000
+      - key: NODE_ENV
+        value: production
